@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo } from "react";
 import {
   LineChart,
   Line,
@@ -8,9 +8,10 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
   ReferenceLine,
+  Area,
+  ComposedChart,
 } from "recharts";
 
 // Seed-based pseudo-random for reproducible simulations
@@ -23,9 +24,27 @@ function mulberry32(seed: number) {
   };
 }
 
+const MAX_DRAWN_LINES = 20;
+
 interface SimResult {
   betNumber: number;
-  [key: string]: number;
+  ev: number;
+  p5: number;
+  p25: number;
+  median: number;
+  p75: number;
+  p95: number;
+  bandOuter: [number, number];
+  bandInner: [number, number];
+  [key: string]: number | [number, number];
+}
+
+function percentile(sorted: number[], p: number): number {
+  const idx = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
 
 function runSimulations(
@@ -33,19 +52,29 @@ function runSimulations(
   numBets: number,
   avgOdds: number,
   ev: number
-): { data: SimResult[]; stats: { profitable: number; maxDrawdown: number; avgFinal: number } } {
-  // EV% means: on average, each bet returns (1 + ev/100) of the stake
-  // With odds o and EV%, the implied win probability is: p = (1 + ev/100) / o
+) {
   const winProb = (1 + ev / 100) / avgOdds;
   const clampedProb = Math.max(0.001, Math.min(0.999, winProb));
 
-  // Sample points to display (max 200 points on x-axis for performance)
+  // Sample points for x-axis (max 200 for performance)
   const step = Math.max(1, Math.floor(numBets / 200));
   const samplePoints: number[] = [];
   for (let b = 0; b <= numBets; b += step) samplePoints.push(b);
   if (samplePoints[samplePoints.length - 1] !== numBets) samplePoints.push(numBets);
 
-  const data: SimResult[] = samplePoints.map((b) => ({ betNumber: b }));
+  const numPoints = samplePoints.length;
+
+  // How many lines to actually draw on the chart
+  const linesToDraw = Math.min(numSims, MAX_DRAWN_LINES);
+
+  // Store bankroll at each sample point for ALL sims (for percentiles)
+  // bankrollsAtPoint[pointIdx] = array of bankroll values across all sims
+  const bankrollsAtPoint: number[][] = samplePoints.map(() => []);
+
+  // Store drawn line data separately
+  const drawnLines: number[][] = Array.from({ length: linesToDraw }, () =>
+    new Array(numPoints).fill(0)
+  );
 
   let profitable = 0;
   let totalFinal = 0;
@@ -57,24 +86,27 @@ function runSimulations(
     let peak = 0;
     let sampleIdx = 0;
 
-    // Set starting point
-    data[0][`sim${s}`] = 0;
+    // Starting point
+    bankrollsAtPoint[0].push(0);
+    if (s < linesToDraw) drawnLines[s][0] = 0;
     sampleIdx = 1;
 
     for (let b = 1; b <= numBets; b++) {
-      const won = rng() < clampedProb;
-      if (won) {
-        bankroll += (avgOdds - 1); // net profit per unit staked
+      if (rng() < clampedProb) {
+        bankroll += avgOdds - 1;
       } else {
-        bankroll -= 1; // lose the stake
+        bankroll -= 1;
       }
 
       if (bankroll > peak) peak = bankroll;
       const dd = peak - bankroll;
       if (dd > worstDrawdown) worstDrawdown = dd;
 
-      if (sampleIdx < samplePoints.length && b === samplePoints[sampleIdx]) {
-        data[sampleIdx][`sim${s}`] = parseFloat(bankroll.toFixed(2));
+      if (sampleIdx < numPoints && b === samplePoints[sampleIdx]) {
+        bankrollsAtPoint[sampleIdx].push(bankroll);
+        if (s < linesToDraw) {
+          drawnLines[s][sampleIdx] = parseFloat(bankroll.toFixed(2));
+        }
         sampleIdx++;
       }
     }
@@ -83,14 +115,38 @@ function runSimulations(
     totalFinal += bankroll;
   }
 
-  // Add EV line (theoretical expected profit)
-  const evPerBet = ev / 100; // expected profit per unit staked
-  for (let i = 0; i < data.length; i++) {
-    data[i].ev = parseFloat((samplePoints[i] * evPerBet).toFixed(2));
-  }
+  // Build chart data with percentile bands
+  const evPerBet = ev / 100;
+  const data: SimResult[] = samplePoints.map((betNum, i) => {
+    const values = bankrollsAtPoint[i].slice().sort((a, b) => a - b);
+    const p5 = parseFloat(percentile(values, 5).toFixed(2));
+    const p25 = parseFloat(percentile(values, 25).toFixed(2));
+    const med = parseFloat(percentile(values, 50).toFixed(2));
+    const p75 = parseFloat(percentile(values, 75).toFixed(2));
+    const p95 = parseFloat(percentile(values, 95).toFixed(2));
+
+    const point: SimResult = {
+      betNumber: betNum,
+      ev: parseFloat((betNum * evPerBet).toFixed(2)),
+      p5,
+      p25,
+      median: med,
+      p75,
+      p95,
+      bandOuter: [p5, p95],
+      bandInner: [p25, p75],
+    };
+
+    for (let s = 0; s < linesToDraw; s++) {
+      point[`sim${s}`] = drawnLines[s][i];
+    }
+
+    return point;
+  });
 
   return {
     data,
+    linesToDraw,
     stats: {
       profitable: (profitable / numSims) * 100,
       maxDrawdown: parseFloat(worstDrawdown.toFixed(2)),
@@ -106,6 +162,12 @@ const COLORS = [
   "#0ea5e9", "#e11d48", "#84cc16", "#7c3aed", "#fb923c",
 ];
 
+// Logarithmic slider steps for simulations
+const SIM_STEPS = [
+  1, 2, 3, 5, 10, 20, 50, 100, 200, 500,
+  1000, 2000, 5000, 10000, 20000, 50000,
+];
+
 function Slider({
   label,
   value,
@@ -114,6 +176,7 @@ function Slider({
   max,
   step,
   unit,
+  formatValue,
 }: {
   label: string;
   value: number;
@@ -122,13 +185,15 @@ function Slider({
   max: number;
   step: number;
   unit?: string;
+  formatValue?: (v: number) => string;
 }) {
+  const display = formatValue ? formatValue(value) : `${value}`;
   return (
     <div className="flex flex-col gap-1">
       <div className="flex justify-between text-sm">
         <span className="text-zinc-400">{label}</span>
         <span className="font-mono font-bold text-blue-400">
-          {value}
+          {display}
           {unit || ""}
         </span>
       </div>
@@ -145,13 +210,21 @@ function Slider({
   );
 }
 
+function formatNum(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k`;
+  return `${n}`;
+}
+
 export default function Home() {
-  const [numSims, setNumSims] = useState(10);
+  const [simSlider, setSimSlider] = useState(4); // index into SIM_STEPS → 10
   const [ev, setEv] = useState(3);
   const [numBets, setNumBets] = useState(500);
   const [avgOdds, setAvgOdds] = useState(2.0);
 
-  const { data, stats } = useMemo(
+  const numSims = SIM_STEPS[simSlider];
+  const showBands = numSims > MAX_DRAWN_LINES;
+
+  const { data, linesToDraw, stats } = useMemo(
     () => runSimulations(numSims, numBets, avgOdds, ev),
     [numSims, numBets, avgOdds, ev]
   );
@@ -173,11 +246,12 @@ export default function Home() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 bg-zinc-900 rounded-xl p-4 border border-zinc-800">
         <Slider
           label="Simulations"
-          value={numSims}
-          onChange={setNumSims}
-          min={1}
-          max={20}
+          value={simSlider}
+          onChange={(v) => setSimSlider(Math.round(v))}
+          min={0}
+          max={SIM_STEPS.length - 1}
           step={1}
+          formatValue={() => formatNum(numSims)}
         />
         <Slider
           label="Expected Value (EV)"
@@ -193,7 +267,7 @@ export default function Home() {
           value={numBets}
           onChange={setNumBets}
           min={50}
-          max={5000}
+          max={10000}
           step={50}
         />
         <Slider
@@ -206,6 +280,13 @@ export default function Home() {
         />
       </div>
 
+      {/* Info banner when bands are shown */}
+      {showBands && (
+        <div className="bg-blue-950/50 border border-blue-800 rounded-lg px-4 py-2 text-sm text-blue-300 text-center">
+          {formatNum(numSims)} simulations calculees — {linesToDraw} trajectoires affichees + bandes P5-P95 / P25-P75
+        </div>
+      )}
+
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatCard
@@ -215,14 +296,14 @@ export default function Home() {
         />
         <StatCard
           label="Simulations rentables"
-          value={`${stats.profitable.toFixed(0)}%`}
-          sub={`sur ${numSims} simus`}
+          value={`${stats.profitable.toFixed(1)}%`}
+          sub={`sur ${formatNum(numSims)} simus`}
           color={stats.profitable >= 50 ? "text-green-400" : "text-red-400"}
         />
         <StatCard
           label="Profit moyen final"
           value={`${stats.avgFinal > 0 ? "+" : ""}${stats.avgFinal}u`}
-          sub={`apres ${numBets} paris`}
+          sub={`apres ${formatNum(numBets)} paris`}
           color={stats.avgFinal >= 0 ? "text-green-400" : "text-red-400"}
         />
         <StatCard
@@ -236,7 +317,7 @@ export default function Home() {
       {/* Chart */}
       <div className="flex-1 bg-zinc-900 rounded-xl p-4 border border-zinc-800 min-h-[400px]">
         <ResponsiveContainer width="100%" height={450}>
-          <LineChart data={data}>
+          <ComposedChart data={data}>
             <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
             <XAxis
               dataKey="betNumber"
@@ -267,8 +348,47 @@ export default function Home() {
                 fontSize: "12px",
               }}
               labelFormatter={(v) => `Pari #${v}`}
+              formatter={((value: number | [number, number], name: string) => {
+                if (Array.isArray(value)) return [`${value[0]} → ${value[1]}`, name];
+                return [typeof value === "number" ? value.toFixed(2) : value, name];
+              }) as never}
             />
             <ReferenceLine y={0} stroke="#52525b" strokeWidth={2} />
+
+            {/* Percentile bands (only when many sims) */}
+            {showBands && (
+              <Area
+                type="monotone"
+                dataKey="bandOuter"
+                fill="#3b82f6"
+                fillOpacity={0.08}
+                stroke="none"
+                name="P5-P95"
+              />
+            )}
+            {showBands && (
+              <Area
+                type="monotone"
+                dataKey="bandInner"
+                fill="#3b82f6"
+                fillOpacity={0.15}
+                stroke="none"
+                name="P25-P75"
+              />
+            )}
+
+            {/* Median line when bands are shown */}
+            {showBands && (
+              <Line
+                type="monotone"
+                dataKey="median"
+                stroke="#60a5fa"
+                strokeWidth={2}
+                dot={false}
+                name="Mediane"
+              />
+            )}
+
             {/* EV line */}
             <Line
               type="monotone"
@@ -279,22 +399,45 @@ export default function Home() {
               dot={false}
               name="EV theorique"
             />
-            {/* Simulation lines */}
-            {Array.from({ length: numSims }, (_, i) => (
+
+            {/* Individual simulation lines */}
+            {Array.from({ length: linesToDraw }, (_, i) => (
               <Line
                 key={i}
                 type="monotone"
                 dataKey={`sim${i}`}
                 stroke={COLORS[i % COLORS.length]}
-                strokeWidth={1.5}
+                strokeWidth={showBands ? 1 : 1.5}
                 dot={false}
-                name={`Simulation ${i + 1}`}
-                opacity={0.7}
+                name={`Sim ${i + 1}`}
+                opacity={showBands ? 0.4 : 0.7}
               />
             ))}
-          </LineChart>
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
+
+      {/* Legend for bands */}
+      {showBands && (
+        <div className="flex flex-wrap gap-4 justify-center text-xs text-zinc-500">
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-3 rounded bg-blue-500/10 border border-blue-500/30" />
+            Bande P5-P95 (90% des trajectoires)
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-3 h-3 rounded bg-blue-500/25 border border-blue-500/40" />
+            Bande P25-P75 (50% des trajectoires)
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-4 h-0.5 bg-blue-400" />
+            Mediane
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-4 h-0.5 bg-white border-dashed border-t-2 border-white" />
+            EV theorique
+          </span>
+        </div>
+      )}
 
       {/* Explanation */}
       <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800 text-sm text-zinc-400 space-y-2">
@@ -311,9 +454,10 @@ export default function Home() {
           effacee sur le long terme.
         </p>
         <p>
-          <strong className="text-zinc-200">Astuce :</strong> Augmentez les cotes pour
-          voir plus de variance. Augmentez le nombre de paris pour voir la convergence.
-          Un EV negatif montre pourquoi les bookmakers gagnent toujours.
+          <strong className="text-zinc-200">Bandes de percentiles :</strong> A partir de 50+
+          simulations, des bandes colorees montrent ou se situent 90% (P5-P95) et 50%
+          (P25-P75) des trajectoires. Plus les bandes sont etroites, plus la convergence
+          est forte.
         </p>
       </div>
     </div>

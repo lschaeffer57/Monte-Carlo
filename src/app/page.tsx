@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo } from "react";
 import {
   XAxis,
   YAxis,
@@ -30,6 +30,8 @@ function mulberry32(seed: number) {
 // ─── TYPES ───────────────────────────────────────────────────
 const MAX_DRAWN_LINES = 20;
 
+type StakingMode = "flat" | "percent" | "kelly" | "kelly_fraction";
+
 interface SimResult {
   betNumber: number;
   ev: number;
@@ -51,6 +53,14 @@ interface HistoBin {
   pct: number;
 }
 
+interface StakingConfig {
+  mode: StakingMode;
+  flatSize: number;       // flat: units per bet
+  percentSize: number;    // percent: % of bankroll per bet
+  kellyFraction: number;  // kelly_fraction: fraction of kelly (e.g. 0.25 = quarter kelly)
+  startingBankroll: number;
+}
+
 // ─── SIMULATION ENGINE ──────────────────────────────────────
 function percentile(sorted: number[], p: number): number {
   const idx = (p / 100) * (sorted.length - 1);
@@ -60,15 +70,45 @@ function percentile(sorted: number[], p: number): number {
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
 
+function getStake(
+  bankroll: number,
+  config: StakingConfig,
+  avgOdds: number,
+  winProb: number
+): number {
+  switch (config.mode) {
+    case "flat":
+      return config.flatSize;
+    case "percent":
+      return Math.max(0.01, bankroll * (config.percentSize / 100));
+    case "kelly": {
+      // Kelly formula: f* = (bp - q) / b where b = odds-1, p = win prob, q = 1-p
+      const b = avgOdds - 1;
+      const f = (b * winProb - (1 - winProb)) / b;
+      return Math.max(0.01, bankroll * Math.max(0, f));
+    }
+    case "kelly_fraction": {
+      const b2 = avgOdds - 1;
+      const f2 = (b2 * winProb - (1 - winProb)) / b2;
+      return Math.max(0.01, bankroll * Math.max(0, f2) * config.kellyFraction);
+    }
+    default:
+      return config.flatSize;
+  }
+}
+
 function runSimulations(
   numSims: number,
   numBets: number,
   avgOdds: number,
   ev: number,
-  ruinThreshold: number
+  ruinThreshold: number,
+  staking: StakingConfig
 ) {
   const winProb = (1 + ev / 100) / avgOdds;
   const clampedProb = Math.max(0.001, Math.min(0.999, winProb));
+  const isFlat = staking.mode === "flat";
+  const startBR = staking.startingBankroll;
 
   const step = Math.max(1, Math.floor(numBets / 200));
   const samplePoints: number[] = [];
@@ -88,36 +128,59 @@ function runSimulations(
   let totalFinal = 0;
   let worstDrawdown = 0;
   let ruinCount = 0;
+  let bustCount = 0; // bankroll reaches 0
 
   for (let s = 0; s < numSims; s++) {
     const rng = mulberry32(s * 31337 + 42);
-    let bankroll = 0;
-    let peak = 0;
+    let bankroll = isFlat ? 0 : startBR;
+    const startVal = bankroll;
+    let peak = bankroll;
     let sampleIdx = 0;
     let ruined = false;
+    let busted = false;
 
-    bankrollsAtPoint[0].push(0);
-    if (s < linesToDraw) drawnLines[s][0] = 0;
+    bankrollsAtPoint[0].push(bankroll);
+    if (s < linesToDraw) drawnLines[s][0] = bankroll;
     sampleIdx = 1;
 
     for (let b = 1; b <= numBets; b++) {
+      // Calculate stake based on strategy
+      const stake = isFlat
+        ? staking.flatSize
+        : getStake(bankroll, staking, avgOdds, clampedProb);
+
+      // If bankroll can't cover the bet, skip (busted)
+      if (!isFlat && bankroll < 0.01) {
+        if (!busted) { busted = true; bustCount++; }
+        // Record same bankroll
+        if (sampleIdx < numPoints && b === samplePoints[sampleIdx]) {
+          bankrollsAtPoint[sampleIdx].push(bankroll);
+          if (bankroll > startVal) profitableAtPoint[sampleIdx]++;
+          if (s < linesToDraw) drawnLines[s][sampleIdx] = parseFloat(bankroll.toFixed(2));
+          sampleIdx++;
+        }
+        continue;
+      }
+
       if (rng() < clampedProb) {
-        bankroll += avgOdds - 1;
+        bankroll += stake * (avgOdds - 1);
       } else {
-        bankroll -= 1;
+        bankroll -= stake;
       }
 
       if (bankroll > peak) peak = bankroll;
       const dd = peak - bankroll;
       if (dd > worstDrawdown) worstDrawdown = dd;
-      if (!ruined && bankroll <= -ruinThreshold) {
+
+      const ruinLevel = isFlat ? -ruinThreshold : startBR - ruinThreshold;
+      if (!ruined && bankroll <= ruinLevel) {
         ruined = true;
         ruinCount++;
       }
 
       if (sampleIdx < numPoints && b === samplePoints[sampleIdx]) {
         bankrollsAtPoint[sampleIdx].push(bankroll);
-        if (bankroll > 0) profitableAtPoint[sampleIdx]++;
+        if (isFlat ? bankroll > 0 : bankroll > startVal) profitableAtPoint[sampleIdx]++;
         if (s < linesToDraw) {
           drawnLines[s][sampleIdx] = parseFloat(bankroll.toFixed(2));
         }
@@ -125,12 +188,13 @@ function runSimulations(
       }
     }
 
-    finalPnls.push(bankroll);
-    if (bankroll > 0) profitable++;
-    totalFinal += bankroll;
+    const pnl = isFlat ? bankroll : bankroll - startBR;
+    finalPnls.push(pnl);
+    if (pnl > 0) profitable++;
+    totalFinal += pnl;
   }
 
-  // Convergence point: first sample where >= 90% of sims are profitable
+  // Convergence
   let convergenceBet: number | null = null;
   for (let i = 1; i < numPoints; i++) {
     if (profitableAtPoint[i] / numSims >= 0.9) {
@@ -139,8 +203,8 @@ function runSimulations(
     }
   }
 
-  // Build chart data
-  const evPerBet = ev / 100;
+  // Build chart data — for non-flat modes, show bankroll directly
+  const evPerBet = isFlat ? ev / 100 : (ev / 100) * staking.flatSize; // approximate EV line
   const data: SimResult[] = samplePoints.map((betNum, i) => {
     const values = bankrollsAtPoint[i].slice().sort((a, b) => a - b);
     const p5v = parseFloat(percentile(values, 5).toFixed(2));
@@ -149,9 +213,13 @@ function runSimulations(
     const p75v = parseFloat(percentile(values, 75).toFixed(2));
     const p95v = parseFloat(percentile(values, 95).toFixed(2));
 
+    const evVal = isFlat
+      ? parseFloat((betNum * (ev / 100)).toFixed(2))
+      : parseFloat((startBR * Math.pow(1 + (ev / 100) * getTheoreticalStakeFraction(staking, avgOdds, clampedProb), betNum)).toFixed(2));
+
     const point: SimResult = {
       betNumber: betNum,
-      ev: parseFloat((betNum * evPerBet).toFixed(2)),
+      ev: evVal,
       p5: p5v,
       p25: p25v,
       median: med,
@@ -168,7 +236,7 @@ function runSimulations(
     return point;
   });
 
-  // Histogram of final PnLs
+  // Histogram
   const sortedFinals = finalPnls.slice().sort((a, b) => a - b);
   const hMin = sortedFinals[0];
   const hMax = sortedFinals[sortedFinals.length - 1];
@@ -188,7 +256,7 @@ function runSimulations(
     });
   }
 
-  // Color each drawn line by final PnL (red → green gradient)
+  // Line colors
   const lineColors: string[] = [];
   for (let s = 0; s < linesToDraw; s++) {
     const final_ = drawnLines[s][numPoints - 1];
@@ -196,7 +264,7 @@ function runSimulations(
     const minF = Math.min(...allFinals);
     const maxF = Math.max(...allFinals);
     const range = maxF - minF || 1;
-    const t = (final_ - minF) / range; // 0 = worst, 1 = best
+    const t = (final_ - minF) / range;
     lineColors.push(interpolateColor(t));
   }
 
@@ -211,10 +279,29 @@ function runSimulations(
       maxDrawdown: parseFloat(worstDrawdown.toFixed(2)),
       avgFinal: parseFloat((totalFinal / numSims).toFixed(2)),
       ruinPct: parseFloat(((ruinCount / numSims) * 100).toFixed(1)),
+      bustPct: parseFloat(((bustCount / numSims) * 100).toFixed(1)),
       medianFinal: parseFloat(percentile(sortedFinals, 50).toFixed(2)),
       stdDev: parseFloat(stddev(finalPnls).toFixed(2)),
     },
   };
+}
+
+// Theoretical stake fraction for EV line approximation in non-flat modes
+function getTheoreticalStakeFraction(staking: StakingConfig, avgOdds: number, winProb: number): number {
+  switch (staking.mode) {
+    case "percent":
+      return staking.percentSize / 100;
+    case "kelly": {
+      const b = avgOdds - 1;
+      return Math.max(0, (b * winProb - (1 - winProb)) / b);
+    }
+    case "kelly_fraction": {
+      const b = avgOdds - 1;
+      return Math.max(0, ((b * winProb - (1 - winProb)) / b) * staking.kellyFraction);
+    }
+    default:
+      return 0;
+  }
 }
 
 function stddev(arr: number[]): number {
@@ -223,17 +310,23 @@ function stddev(arr: number[]): number {
 }
 
 function interpolateColor(t: number): string {
-  // 0 = red (#ef4444), 0.5 = yellow (#eab308), 1 = green (#22c55e)
   const r = t < 0.5 ? 239 : Math.round(239 - (239 - 34) * ((t - 0.5) * 2));
   const g = t < 0.5 ? Math.round(68 + (179 - 68) * (t * 2)) : Math.round(179 + (197 - 179) * ((t - 0.5) * 2));
   const b = t < 0.5 ? Math.round(68 + (8 - 68) * (t * 2)) : Math.round(8 + (94 - 8) * ((t - 0.5) * 2));
   return `rgb(${r},${g},${b})`;
 }
 
-// ─── SLIDER STEPS ────────────────────────────────────────────
+// ─── CONSTANTS ───────────────────────────────────────────────
 const SIM_STEPS = [
   1, 2, 3, 5, 10, 20, 50, 100, 200, 500,
   1000, 2000, 5000, 10000, 20000, 50000,
+];
+
+const STAKING_MODES: { value: StakingMode; label: string; desc: string }[] = [
+  { value: "flat", label: "Flat", desc: "Mise fixe (unites)" },
+  { value: "percent", label: "% Bankroll", desc: "% de la bankroll actuelle" },
+  { value: "kelly", label: "Kelly", desc: "Critere de Kelly complet" },
+  { value: "kelly_fraction", label: "Fraction Kelly", desc: "Fraction du Kelly" },
 ];
 
 // ─── COMPONENTS ──────────────────────────────────────────────
@@ -302,8 +395,14 @@ function StatCard({
 }
 
 function formatNum(n: number): string {
-  if (n >= 1000) return `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k`;
+  if (Math.abs(n) >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+  if (Math.abs(n) >= 1000) return `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k`;
   return `${n}`;
+}
+
+function formatUnit(n: number, isFlat: boolean): string {
+  if (isFlat) return `${n}u`;
+  return `${n.toFixed(0)}$`;
 }
 
 // ─── CUSTOM TOOLTIP ─────────────────────────────────────────
@@ -324,13 +423,13 @@ function CustomTooltip({ active, payload, label }: { active?: boolean; payload?:
       {evLine && (
         <div className="flex justify-between gap-4">
           <span className="text-zinc-400">EV theorique</span>
-          <span className="font-mono text-white font-bold">{(evLine.value as number).toFixed(2)}u</span>
+          <span className="font-mono text-white font-bold">{Number(evLine.value).toFixed(2)}</span>
         </div>
       )}
       {medianLine && (
         <div className="flex justify-between gap-4">
           <span className="text-zinc-400">Mediane</span>
-          <span className="font-mono text-blue-400">{(medianLine.value as number).toFixed(2)}u</span>
+          <span className="font-mono text-blue-400">{Number(medianLine.value).toFixed(2)}</span>
         </div>
       )}
       {outer && Array.isArray(outer.value) && (
@@ -365,15 +464,39 @@ export default function Home() {
   const [avgOdds, setAvgOdds] = useState(2.0);
   const [ruinThreshold, setRuinThreshold] = useState(50);
 
+  // Staking
+  const [stakingMode, setStakingMode] = useState<StakingMode>("flat");
+  const [flatSize, setFlatSize] = useState(1);
+  const [percentSize, setPercentSize] = useState(2);
+  const [kellyFraction, setKellyFraction] = useState(0.25);
+  const [startingBankroll, setStartingBankroll] = useState(1000);
+
   const numSims = SIM_STEPS[simSlider];
   const showBands = numSims > MAX_DRAWN_LINES;
+  const isFlat = stakingMode === "flat";
+
+  const staking: StakingConfig = {
+    mode: stakingMode,
+    flatSize,
+    percentSize,
+    kellyFraction,
+    startingBankroll,
+  };
 
   const { data, linesToDraw, lineColors, histogram, convergenceBet, stats } = useMemo(
-    () => runSimulations(numSims, numBets, avgOdds, ev, ruinThreshold),
-    [numSims, numBets, avgOdds, ev, ruinThreshold]
+    () => runSimulations(numSims, numBets, avgOdds, ev, ruinThreshold, staking),
+    [numSims, numBets, avgOdds, ev, ruinThreshold, stakingMode, flatSize, percentSize, kellyFraction, startingBankroll]
   );
 
   const winProb = ((1 + ev / 100) / avgOdds * 100).toFixed(1);
+
+  // Kelly info
+  const kellyPct = useMemo(() => {
+    const b = avgOdds - 1;
+    const p = Math.max(0.001, Math.min(0.999, (1 + ev / 100) / avgOdds));
+    const f = (b * p - (1 - p)) / b;
+    return Math.max(0, f * 100);
+  }, [avgOdds, ev]);
 
   return (
     <div className="flex flex-col min-h-screen p-4 md:p-8 gap-6 max-w-[1400px] mx-auto w-full">
@@ -387,7 +510,7 @@ export default function Home() {
         </p>
       </header>
 
-      {/* Controls */}
+      {/* Controls — row 1: main params */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 bg-zinc-900/80 backdrop-blur rounded-xl p-4 border border-zinc-800">
         <Slider
           label="Simulations"
@@ -428,14 +551,138 @@ export default function Home() {
           value={ruinThreshold}
           onChange={setRuinThreshold}
           min={10}
-          max={200}
+          max={500}
           step={5}
-          unit="u"
+          unit={isFlat ? "u" : "$"}
         />
       </div>
 
+      {/* Controls — row 2: staking strategy */}
+      <div className="bg-zinc-900/80 backdrop-blur rounded-xl p-4 border border-zinc-800">
+        <div className="flex items-center gap-2 mb-3">
+          <h2 className="text-sm font-semibold text-zinc-300">Strategie de mise</h2>
+          <span className="text-xs text-zinc-600">—</span>
+          <span className="text-xs text-zinc-500">
+            {STAKING_MODES.find((m) => m.value === stakingMode)?.desc}
+          </span>
+        </div>
+
+        {/* Mode selector */}
+        <div className="flex flex-wrap gap-2 mb-4">
+          {STAKING_MODES.map((mode) => (
+            <button
+              key={mode.value}
+              onClick={() => setStakingMode(mode.value)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 border ${
+                stakingMode === mode.value
+                  ? "bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-500/20"
+                  : "bg-zinc-800 border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+              }`}
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Mode-specific controls */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {stakingMode === "flat" && (
+            <Slider
+              label="Mise fixe"
+              value={flatSize}
+              onChange={setFlatSize}
+              min={0.5}
+              max={10}
+              step={0.5}
+              unit="u"
+            />
+          )}
+
+          {stakingMode === "percent" && (
+            <>
+              <Slider
+                label="Bankroll initiale"
+                value={startingBankroll}
+                onChange={setStartingBankroll}
+                min={100}
+                max={10000}
+                step={100}
+                unit="$"
+              />
+              <Slider
+                label="Mise par pari"
+                value={percentSize}
+                onChange={setPercentSize}
+                min={0.5}
+                max={20}
+                step={0.5}
+                unit="%"
+              />
+            </>
+          )}
+
+          {stakingMode === "kelly" && (
+            <>
+              <Slider
+                label="Bankroll initiale"
+                value={startingBankroll}
+                onChange={setStartingBankroll}
+                min={100}
+                max={10000}
+                step={100}
+                unit="$"
+              />
+              <div className="flex flex-col gap-1 justify-center">
+                <span className="text-xs text-zinc-500">Kelly optimal</span>
+                <span className="font-mono text-lg font-bold text-yellow-400">{kellyPct.toFixed(2)}%</span>
+                <span className="text-xs text-zinc-600">de la bankroll par pari</span>
+              </div>
+            </>
+          )}
+
+          {stakingMode === "kelly_fraction" && (
+            <>
+              <Slider
+                label="Bankroll initiale"
+                value={startingBankroll}
+                onChange={setStartingBankroll}
+                min={100}
+                max={10000}
+                step={100}
+                unit="$"
+              />
+              <Slider
+                label="Fraction du Kelly"
+                value={kellyFraction}
+                onChange={setKellyFraction}
+                min={0.05}
+                max={1}
+                step={0.05}
+                formatValue={(v) => `${(v * 100).toFixed(0)}%`}
+              />
+              <div className="flex flex-col gap-1 justify-center">
+                <span className="text-xs text-zinc-500">Mise effective</span>
+                <span className="font-mono text-lg font-bold text-cyan-400">
+                  {(kellyPct * kellyFraction).toFixed(2)}%
+                </span>
+                <span className="text-xs text-zinc-600">
+                  ({kellyFraction * 100}% x {kellyPct.toFixed(2)}% Kelly)
+                </span>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Kelly warning */}
+        {stakingMode === "kelly" && (
+          <div className="mt-3 bg-yellow-950/40 border border-yellow-800/50 rounded-lg px-3 py-2 text-xs text-yellow-300/80">
+            Le Kelly complet est tres agressif et peut causer de fortes variations. Preferez le Fraction Kelly (25-50%) pour une approche plus stable.
+          </div>
+        )}
+      </div>
+
       {/* Stats row */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-3">
         <StatCard
           label="Prob. de gain / pari"
           value={`${winProb}%`}
@@ -449,25 +696,33 @@ export default function Home() {
         />
         <StatCard
           label="Profit moyen"
-          value={`${stats.avgFinal > 0 ? "+" : ""}${stats.avgFinal}u`}
-          sub={`median: ${stats.medianFinal > 0 ? "+" : ""}${stats.medianFinal}u`}
+          value={`${stats.avgFinal > 0 ? "+" : ""}${formatNum(Math.round(stats.avgFinal))}`}
+          sub={`median: ${stats.medianFinal > 0 ? "+" : ""}${formatNum(Math.round(stats.medianFinal))}`}
           color={stats.avgFinal >= 0 ? "text-green-400" : "text-red-400"}
         />
         <StatCard
           label="Ecart-type"
-          value={`${stats.stdDev}u`}
+          value={formatNum(Math.round(stats.stdDev))}
           sub="volatilite finale"
           color="text-purple-400"
         />
         <StatCard
           label="Prob. de ruine"
           value={`${stats.ruinPct}%`}
-          sub={`seuil: -${ruinThreshold}u`}
+          sub={`seuil: -${ruinThreshold}`}
           color={stats.ruinPct <= 5 ? "text-green-400" : stats.ruinPct <= 20 ? "text-yellow-400" : "text-red-400"}
         />
+        {!isFlat && (
+          <StatCard
+            label="Faillite (BR=0)"
+            value={`${stats.bustPct}%`}
+            sub="bankroll epuisee"
+            color={stats.bustPct <= 1 ? "text-green-400" : stats.bustPct <= 10 ? "text-yellow-400" : "text-red-400"}
+          />
+        )}
         <StatCard
           label="Pire drawdown"
-          value={`${stats.maxDrawdown}u`}
+          value={formatNum(Math.round(stats.maxDrawdown))}
           sub="sur toutes les simus"
           color="text-orange-400"
         />
@@ -485,17 +740,26 @@ export default function Home() {
         </div>
       )}
 
-      {/* Main chart + Histogram side by side */}
+      {/* Main chart + Histogram */}
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4">
-        {/* Main trajectory chart */}
+        {/* Trajectory chart */}
         <div className="bg-zinc-900/80 backdrop-blur rounded-xl p-4 border border-zinc-800 min-h-[450px]">
           <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold text-zinc-300">Trajectoires de bankroll</h2>
-            {showBands && (
-              <span className="text-xs text-zinc-500">
-                {formatNum(numSims)} simus / {linesToDraw} tracees
-              </span>
-            )}
+            <h2 className="text-sm font-semibold text-zinc-300">
+              {isFlat ? "Trajectoires P&L" : "Evolution de la bankroll"}
+            </h2>
+            <div className="flex items-center gap-3">
+              {!isFlat && (
+                <span className="text-xs text-zinc-500">
+                  BR initiale: {startingBankroll}$
+                </span>
+              )}
+              {showBands && (
+                <span className="text-xs text-zinc-500">
+                  {formatNum(numSims)} simus / {linesToDraw} tracees
+                </span>
+              )}
+            </div>
           </div>
           <ResponsiveContainer width="100%" height={420}>
             <ComposedChart data={data}>
@@ -519,10 +783,10 @@ export default function Home() {
               <YAxis
                 stroke="#52525b"
                 fontSize={11}
-                tickFormatter={(v) => `${v > 0 ? "+" : ""}${formatNum(v)}`}
+                tickFormatter={(v) => isFlat ? `${v > 0 ? "+" : ""}${formatNum(v)}` : `${formatNum(v)}`}
               />
               <Tooltip content={<CustomTooltip />} />
-              <ReferenceLine y={0} stroke="#3f3f46" strokeWidth={1.5} />
+              <ReferenceLine y={isFlat ? 0 : startingBankroll} stroke="#3f3f46" strokeWidth={1.5} />
 
               {/* Convergence marker */}
               {convergenceBet !== null && (
@@ -540,45 +804,18 @@ export default function Home() {
                 />
               )}
 
-              {/* Hidden line for tooltip data */}
               <Line type="monotone" dataKey="pctProfitable" stroke="none" dot={false} name="% En profit" />
 
-              {/* Percentile bands */}
               {showBands && (
-                <Area
-                  type="monotone"
-                  dataKey="bandOuter"
-                  fill="url(#bandOuterGrad)"
-                  stroke="none"
-                  name="P5-P95"
-                  animationDuration={800}
-                />
+                <Area type="monotone" dataKey="bandOuter" fill="url(#bandOuterGrad)" stroke="none" name="P5-P95" animationDuration={800} />
               )}
               {showBands && (
-                <Area
-                  type="monotone"
-                  dataKey="bandInner"
-                  fill="url(#bandInnerGrad)"
-                  stroke="none"
-                  name="P25-P75"
-                  animationDuration={800}
-                />
+                <Area type="monotone" dataKey="bandInner" fill="url(#bandInnerGrad)" stroke="none" name="P25-P75" animationDuration={800} />
+              )}
+              {showBands && (
+                <Line type="monotone" dataKey="median" stroke="#60a5fa" strokeWidth={2} dot={false} name="Mediane" animationDuration={600} />
               )}
 
-              {/* Median */}
-              {showBands && (
-                <Line
-                  type="monotone"
-                  dataKey="median"
-                  stroke="#60a5fa"
-                  strokeWidth={2}
-                  dot={false}
-                  name="Mediane"
-                  animationDuration={600}
-                />
-              )}
-
-              {/* EV line */}
               <Line
                 type="monotone"
                 dataKey="ev"
@@ -590,7 +827,6 @@ export default function Home() {
                 animationDuration={600}
               />
 
-              {/* Simulation lines with gradient colors */}
               {Array.from({ length: linesToDraw }, (_, i) => (
                 <Line
                   key={i}
@@ -605,7 +841,6 @@ export default function Home() {
                 />
               ))}
 
-              {/* Zoom brush */}
               <Brush
                 dataKey="betNumber"
                 height={25}
@@ -629,8 +864,8 @@ export default function Home() {
                 dataKey="center"
                 stroke="#52525b"
                 fontSize={9}
-                width={45}
-                tickFormatter={(v) => `${v > 0 ? "+" : ""}${v}`}
+                width={50}
+                tickFormatter={(v) => `${v > 0 ? "+" : ""}${formatNum(v)}`}
               />
               <Tooltip
                 contentStyle={{
@@ -640,14 +875,14 @@ export default function Home() {
                   fontSize: "11px",
                 }}
                 formatter={((value: number) => [`${value}%`, "Frequence"]) as never}
-                labelFormatter={(v) => `~${v}u`}
+                labelFormatter={(v) => `~${v}`}
               />
               <ReferenceLine y={0} stroke="#52525b" strokeWidth={1} />
               <Bar dataKey="pct" radius={[0, 3, 3, 0]} animationDuration={600}>
                 {histogram.map((bin, i) => (
                   <Cell
                     key={i}
-                    fill={bin.center >= 0 ? "#22c55e" : "#ef4444"}
+                    fill={bin.center >= (isFlat ? 0 : startingBankroll) ? "#22c55e" : "#ef4444"}
                     fillOpacity={0.7 + (bin.pct / 100) * 0.3}
                   />
                 ))}
@@ -694,24 +929,17 @@ export default function Home() {
       {/* Explanation */}
       <div className="bg-zinc-900/80 backdrop-blur rounded-xl p-4 border border-zinc-800 text-sm text-zinc-400 space-y-2">
         <p>
-          <strong className="text-zinc-200">Degrade de couleurs :</strong> Les trajectoires vont du
-          rouge (pire resultat) au vert (meilleur). Cela permet de voir immediatement la dispersion
-          des resultats possibles.
+          <strong className="text-zinc-200">Strategies de mise :</strong>
         </p>
-        <p>
-          <strong className="text-zinc-200">Zone de convergence :</strong> La ligne verte verticale
-          marque le moment ou 90% des simulations sont en profit. Avant ce point, la variance domine.
-          Apres, la loi des grands nombres prend le dessus.
-        </p>
-        <p>
-          <strong className="text-zinc-200">Probabilite de ruine :</strong> Pourcentage de simulations
-          qui touchent le seuil de ruine (-{ruinThreshold}u). Meme avec un EV positif, le risque de ruine
-          reste reel si la bankroll est trop faible par rapport a la variance.
-        </p>
-        <p>
-          <strong className="text-zinc-200">Histogramme :</strong> La distribution des profits finaux.
-          Plus la cloche est resserree autour de l&apos;EV, plus la variance est maitrisee.
-          Utilisez le zoom (barre sous le graphe) pour explorer une zone specifique.
+        <ul className="list-disc list-inside space-y-1 ml-2">
+          <li><strong className="text-zinc-300">Flat</strong> — Mise fixe a chaque pari. Simple et previsible. La bankroll evolue lineairement.</li>
+          <li><strong className="text-zinc-300">% Bankroll</strong> — Mise proportionnelle a la bankroll actuelle. Protege contre la ruine totale (on ne peut jamais perdre 100%), mais les gains sont aussi proportionnels.</li>
+          <li><strong className="text-zinc-300">Kelly</strong> — Mise optimale mathematiquement pour maximiser la croissance a long terme. Tres volatile a court terme. Formule : f* = (bp - q) / b.</li>
+          <li><strong className="text-zinc-300">Fraction Kelly</strong> — Fraction du Kelly (ex: 25%). Reduit la volatilite tout en conservant une bonne croissance. Le sweet spot pour la plupart des parieurs.</li>
+        </ul>
+        <p className="mt-2">
+          <strong className="text-zinc-200">Conseil :</strong> Comparez le Kelly complet vs le 25% Kelly avec 1000+ paris.
+          Le Kelly complet a un meilleur rendement theorique mais une volatilite extreme. Le fractional Kelly offre un bien meilleur ratio rendement/risque.
         </p>
       </div>
     </div>
